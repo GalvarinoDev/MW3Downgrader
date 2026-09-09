@@ -1,0 +1,53 @@
+name: Build MW3 Downgrader
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+
+      - name: Download DepotDownloader
+        shell: pwsh
+        run: |
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/SteamRE/DepotDownloader/releases/latest"
+          $asset = $release.assets | Where-Object { $_.name -like "*win-x64*" } | Select-Object -First 1
+          if (-not $asset) { throw "Could not find win-x64 asset" }
+          Write-Host "Downloading $($asset.name)..."
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile "dd.zip"
+          Expand-Archive -Path "dd.zip" -DestinationPath "dd_extracted"
+          Copy-Item "dd_extracted\DepotDownloader.exe" -Destination "."
+          if (-not (Test-Path "DepotDownloader.exe")) { throw "DepotDownloader.exe not found after extraction" }
+          Write-Host "DepotDownloader.exe ready"
+
+      - name: Build exe
+        run: |
+          pyinstaller --onefile --add-binary "DepotDownloader.exe;." --name "MW3_Downgrader" --icon "NONE" --console mw3_downgrade.py
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MW3_Downgrader
+          path: dist/MW3_Downgrader.exe
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/MW3_Downgrader.exe
+          generate_release_notes: true
