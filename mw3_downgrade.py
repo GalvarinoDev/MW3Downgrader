@@ -54,8 +54,13 @@ class C:
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-IW5_APP_ID   = 42680   # MW3 base app
-IW5_MP_APPID = "42690"  # MW3 Multiplayer (for appmanifest detection)
+IW5_APP_ID = 42680  # MW3 base app
+
+# Appids to search for (MP and Dedicated Server)
+IW5_APPIDS = {
+    "42690": "Multiplayer",
+    "42750": "Dedicated Server",
+}
 
 IW5_DEPOTS = (
     {"depot": 42682, "manifest": "2661317971072643596"},
@@ -215,44 +220,56 @@ def find_library_dirs(steam_root: str) -> list[str]:
     return dirs
 
 
-def find_mw3_install(steam_root: str) -> str | None:
+def find_mw3_installs(steam_root: str) -> list[dict]:
     """
-    Locate the MW3 install directory across all Steam libraries.
-    Checks for appmanifest_42690.acf (MP) with StateFlags 4.
+    Locate all MW3 install directories across all Steam libraries.
+    Checks for both Multiplayer (42690) and Dedicated Server (42750).
+    Returns a list of dicts with 'appid', 'label', and 'install_dir'.
     """
     library_dirs = find_library_dirs(steam_root)
     if not library_dirs:
-        return None
+        return []
 
-    for steamapps_dir in library_dirs:
-        acf = os.path.join(steamapps_dir, f"appmanifest_{IW5_MP_APPID}.acf")
-        if not os.path.isfile(acf):
-            continue
+    found = []
+    seen_dirs = set()
 
-        install_name = None
-        state_flags = None
-        try:
-            with open(acf, "r", encoding="utf-8", errors="replace") as f:
-                for line in f:
-                    m = re.search(r'"installdir"\s+"([^"]+)"', line)
-                    if m:
-                        install_name = m.group(1)
-                    m = re.search(r'"StateFlags"\s+"(\d+)"', line)
-                    if m:
-                        state_flags = m.group(1)
-                    if install_name and state_flags:
-                        break
-        except Exception:
-            continue
+    for appid, label in IW5_APPIDS.items():
+        for steamapps_dir in library_dirs:
+            acf = os.path.join(steamapps_dir, f"appmanifest_{appid}.acf")
+            if not os.path.isfile(acf):
+                continue
 
-        if not install_name or state_flags != "4":
-            continue
+            install_name = None
+            state_flags = None
+            try:
+                with open(acf, "r", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        m = re.search(r'"installdir"\s+"([^"]+)"', line)
+                        if m:
+                            install_name = m.group(1)
+                        m = re.search(r'"StateFlags"\s+"(\d+)"', line)
+                        if m:
+                            state_flags = m.group(1)
+                        if install_name and state_flags:
+                            break
+            except Exception:
+                continue
 
-        install_dir = os.path.join(steamapps_dir, "common", install_name)
-        if os.path.isdir(install_dir):
-            return install_dir
+            if not install_name or state_flags != "4":
+                continue
 
-    return None
+            install_dir = os.path.join(steamapps_dir, "common", install_name)
+            norm = os.path.normpath(install_dir).lower()
+            if os.path.isdir(install_dir) and norm not in seen_dirs:
+                seen_dirs.add(norm)
+                found.append({
+                    "appid": appid,
+                    "label": label,
+                    "install_dir": install_dir,
+                })
+                break  # found this appid, move to next
+
+    return found
 
 
 # ── Detection ────────────────────────────────────────────────────────────────
@@ -625,16 +642,17 @@ def main():
 
     # Step 2: Find MW3
     info("Searching for MW3 (Call of Duty: Modern Warfare 3)...")
-    install_dir = find_mw3_install(steam_root)
-    if not install_dir:
+    installs = find_mw3_installs(steam_root)
+
+    if not installs:
         fail("MW3 not found in any Steam library.")
-        fail("Make sure MW3 multiplayer (appid 42690) is installed.")
+        fail("Make sure MW3 Multiplayer (42690) or Dedicated Server (42750) is installed.")
         print()
         # Offer manual path entry
         if ask_yes_no("Enter the MW3 install path manually?", default=False):
             manual = input("  Path: ").strip().strip('"')
             if os.path.isdir(manual):
-                install_dir = manual
+                installs = [{"appid": "manual", "label": "Manual", "install_dir": manual}]
             else:
                 fail(f"Directory not found: {manual}")
                 press_enter("Press Enter to exit...")
@@ -643,31 +661,84 @@ def main():
             press_enter("Press Enter to exit...")
             return 1
 
-    ok(f"MW3 found: {install_dir}")
+    if len(installs) == 1:
+        install_dir = installs[0]["install_dir"]
+        ok(f"MW3 {installs[0]['label']} found: {install_dir}")
+    else:
+        # Multiple installs found, let user pick
+        print()
+        info("Multiple MW3 installs found:")
+        print()
+        for i, inst in enumerate(installs, 1):
+            print(f"    {C.CYAN}{i}{C.RESET}  {inst['label']} (appid {inst['appid']})")
+            print(f"       {C.DIM}{inst['install_dir']}{C.RESET}")
+            print()
 
-    # Step 3: Check if downgrade is needed
+        # Check if all need downgrading
+        need_downgrade = [inst for inst in installs if is_iw5_64bit(inst["install_dir"])]
+        all_option = None
+        if len(need_downgrade) > 1:
+            all_option = str(len(installs) + 1)
+            print(f"    {C.CYAN}{all_option}{C.RESET}  Downgrade all")
+            print()
+
+        valid = [str(i) for i in range(1, len(installs) + 1)]
+        if all_option:
+            valid.append(all_option)
+
+        while True:
+            pick = input(f"  {C.YELLOW}  ?   Choose install ({'/'.join(valid)}):{C.RESET} ").strip()
+            if pick in valid:
+                break
+
+        if pick == all_option:
+            # Downgrade all installs that need it
+            for inst in need_downgrade:
+                print()
+                info(f"Processing {inst['label']} ({inst['appid']})...")
+                ok(f"Install dir: {inst['install_dir']}")
+                result = downgrade_install(inst["install_dir"], steam_root)
+                if not result:
+                    fail(f"Failed to downgrade {inst['label']}.")
+            press_enter("Press Enter to exit...")
+            return 0
+        else:
+            idx = int(pick) - 1
+            install_dir = installs[idx]["install_dir"]
+            ok(f"MW3 {installs[idx]['label']} selected: {install_dir}")
+
+    # Run the downgrade
+    success = downgrade_install(install_dir, steam_root)
+    press_enter("Press Enter to exit...")
+    return 0 if success else 1
+
+
+def downgrade_install(install_dir: str, steam_root: str) -> bool:
+    """
+    Run the full downgrade flow for a single MW3 install directory.
+    Returns True on success, False on failure.
+    """
+    # Check if downgrade is needed
     info("Checking MW3 version...")
     if not is_iw5_64bit(install_dir):
         print()
         ok("MW3 is already 32-bit. No downgrade needed.")
         ok("Plutonium should work with this install.")
-        press_enter("Press Enter to exit...")
-        return 0
+        return True
 
     warn("MW3 is 64-bit. Downgrade required for Plutonium.")
 
-    # Step 4: Check disk space
+    # Check disk space
     free_gb = check_free_space_gb(install_dir)
     info(f"Free disk space: {free_gb:.1f} GB (need {REQUIRED_FREE_SPACE_GB} GB)")
     if not has_enough_space(install_dir):
         fail(f"Not enough free disk space. Need at least {REQUIRED_FREE_SPACE_GB} GB.")
         fail("Free up space on the drive where MW3 is installed and try again.")
-        press_enter("Press Enter to exit...")
-        return 1
+        return False
 
     ok("Sufficient disk space.")
 
-    # Step 5: Choose download method
+    # Choose download method
     print()
     print(f"  {C.BOLD}Choose a download method:{C.RESET}")
     print()
@@ -691,8 +762,7 @@ def main():
             ok("You can now use Plutonium.")
         else:
             fail("Downgrade did not complete. See errors above.")
-        press_enter("Press Enter to exit...")
-        return 0 if success else 1
+        return success
 
     # Automated path via DepotDownloader
     dd_path = get_depot_downloader_path()
@@ -703,8 +773,7 @@ def main():
             print()
             ok(f"{C.GREEN}{C.BOLD}MW3 downgraded to 32-bit successfully!{C.RESET}")
             ok("You can now use Plutonium.")
-        press_enter("Press Enter to exit...")
-        return 0 if success else 1
+        return success
 
     ok(f"DepotDownloader ready: {os.path.basename(dd_path)}")
 
@@ -734,8 +803,7 @@ def main():
             # Cleanup partial staging
             if os.path.isdir(staging_dir):
                 shutil.rmtree(staging_dir, ignore_errors=True)
-            press_enter("Press Enter to exit...")
-            return 1
+            return False
         # Remember username for second depot (skip QR)
         username = result
 
@@ -755,11 +823,11 @@ def main():
             warn("Merge completed but MW3 still appears to be 64-bit.")
             warn("The marker file (main/iw_00.iwd) size has not changed.")
             warn("Try verifying MW3 files in Steam, then run this tool again.")
+            return False
     else:
         fail("Merge failed. See errors above.")
 
-    press_enter("Press Enter to exit...")
-    return 0 if success else 1
+    return success
 
 
 if __name__ == "__main__":
