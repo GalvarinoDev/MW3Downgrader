@@ -11,10 +11,8 @@ Windows 10 and 11 only. No Python or other software required.
 1. Download `MW3_Downgrader.exe` from the [Releases](https://github.com/GalvarinoDev/MW3Downgrader/releases) page.
 2. Run the exe. Windows SmartScreen may show a warning because the file is unsigned. Click **More info**, then **Run anyway**.
 3. The tool finds your Steam and MW3 install automatically (Multiplayer, Dedicated Server, or both).
-4. Choose a download method:
-   - **Automated**: Scan a QR code with the Steam Mobile App. The tool downloads the 32-bit files for you.
-   - **Manual**: Paste two commands into the Steam console. No extra tools involved.
-5. The tool merges the 32-bit files over your MW3 install and verifies the result.
+4. A QR code appears in the console. Scan it with the Steam Mobile App to authenticate.
+5. The tool downloads the 32-bit depot files, merges them over your MW3 install, and verifies the result.
 
 ## Requirements
 
@@ -36,7 +34,7 @@ After download, the tool deletes the old 64-bit files and moves the 32-bit repla
 The tool only modifies files inside your MW3 install directory. It does not touch Steam, other games, or system files. If something goes wrong, verify MW3 file integrity through Steam to restore the original files.
 
 **Do I need to keep Steam open?**
-For the automated (QR) method, Steam does not need to be running. For the manual method, Steam must be open so you can use its console.
+Steam does not need to be running. The tool uses its own downloader.
 
 **The QR code expired before I could scan it.**
 The tool generates a new QR code automatically. Take your time.

@@ -67,11 +67,6 @@ IW5_DEPOTS = (
     {"depot": 42683, "manifest": "1595601894688570808"},
 )
 
-IW5_DEPOT_IDS    = (42682, 42683)
-IW5_DEPOT_CMDS   = (
-    "download_depot 42680 42682 2661317971072643596",
-    "download_depot 42680 42683 1595601894688570808",
-)
 
 # Detection: main/iw_00.iwd size threshold
 #   32-bit: ~314 MB    64-bit: ~420 MB    threshold: 380 MB
@@ -131,6 +126,30 @@ def ask_yes_no(prompt, default=True):
 
 def press_enter(msg="Press Enter to continue..."):
     input(f"\n  {C.DIM}{msg}{C.RESET}")
+
+
+def progress_bar(percent: float, width: int = 40, label: str = ""):
+    """
+    Draw a progress bar on the current line, overwriting previous output.
+    percent: 0.0 to 100.0
+    """
+    percent = max(0.0, min(100.0, percent))
+    filled = int(width * percent / 100.0)
+    empty = width - filled
+    bar = f"{C.GREEN}{'█' * filled}{C.DIM}{'░' * empty}{C.RESET}"
+    pct = f"{percent:5.1f}%"
+    line = f"\r  {bar}  {pct}"
+    if label:
+        line += f"  {C.DIM}{label}{C.RESET}"
+    # Pad with spaces to clear any leftover characters from longer lines
+    print(f"{line:<100}", end="", flush=True)
+
+
+def progress_bar_done(msg: str = ""):
+    """Finish the progress bar line and print a completion message."""
+    print()  # newline after the bar
+    if msg:
+        ok(msg)
 
 
 # ── DepotDownloader path ─────────────────────────────────────────────────────
@@ -304,23 +323,6 @@ def has_enough_space(path: str) -> bool:
     return check_free_space_gb(path) >= REQUIRED_FREE_SPACE_GB
 
 
-# ── Clipboard ────────────────────────────────────────────────────────────────
-
-def copy_to_clipboard(text: str):
-    """Copy text to the Windows clipboard via clip.exe."""
-    try:
-        proc = subprocess.run(
-            "clip",
-            input=text.encode("utf-8"),
-            shell=True,
-            timeout=5,
-        )
-        if proc.returncode == 0:
-            return True
-    except Exception:
-        pass
-    return False
-
 
 # ── QR detection ─────────────────────────────────────────────────────────────
 
@@ -426,20 +428,20 @@ def run_depot_download(
                 # Progress
                 if "Got depot key" in line:
                     progress(f"Downloading depot {depot_info['depot']}...")
-                elif "%" in line and ("download" in line.lower() or
-                                      "/" in line):
-                    # Overwrite the current line for progress bar effect
-                    print(f"\r  {C.DIM}  ...  {line.strip()}{C.RESET}",
-                          end="", flush=True)
+                elif "%" in line:
+                    # Extract percentage from DepotDownloader output
+                    pct_match = re.search(r"([\d.]+)\s*%", line)
+                    if pct_match:
+                        pct = float(pct_match.group(1))
+                        progress_bar(pct, label=f"Depot {depot_info['depot']}")
                 elif "Total downloaded" in line or "already" in line.lower():
-                    print()  # newline after progress
-                    progress(line.strip())
+                    progress_bar_done(line.strip())
 
             proc.wait()
 
             if proc.returncode == 0 and (auth_succeeded or username):
-                print()  # ensure newline
-                ok(f"Depot {depot_info['depot']} download complete.")
+                progress_bar(100.0, label=f"Depot {depot_info['depot']}")
+                progress_bar_done(f"Depot {depot_info['depot']} download complete.")
                 return captured_username or username
 
             # Remembered credentials failed — don't retry
@@ -467,28 +469,13 @@ def merge_depots(staging_dir: str, install_dir: str):
     Uses delete-then-move strategy:
       1. Delete old 64-bit files that will be replaced (frees space).
       2. Move staged files into place (instant rename on same drive).
-
-    Handles both QR path (files directly in staging_dir) and manual
-    path (depot_XXXXX subdirectories).
     """
-    depot_42682_dir = os.path.join(staging_dir, "depot_42682")
-    has_subdirs = os.path.isdir(depot_42682_dir)
+    info("Merging 32-bit files into MW3 install...")
+    _merge_tree(staging_dir, install_dir)
+    ok("Merge complete.")
 
-    if has_subdirs:
-        # Manual Steam console path: subdirs per depot
-        for depot_id in IW5_DEPOT_IDS:
-            depot_path = os.path.join(staging_dir, f"depot_{depot_id}")
-            if not os.path.isdir(depot_path):
-                fail(f"Depot directory not found: {depot_path}")
-                return False
-            info(f"Merging depot {depot_id}...")
-            _merge_tree(depot_path, install_dir)
-            ok(f"Depot {depot_id} merged.")
-    else:
-        # QR path: files directly in staging_dir
-        info("Merging 32-bit files into MW3 install...")
-        _merge_tree(staging_dir, install_dir)
-        ok("Merge complete.")
+    # Remove any DepotDownloader artifacts from the game directory
+    _cleanup_dd_artifacts(install_dir)
 
     # Cleanup staging
     info("Cleaning up staging files...")
@@ -501,18 +488,49 @@ def merge_depots(staging_dir: str, install_dir: str):
     return True
 
 
+def _cleanup_dd_artifacts(install_dir: str):
+    """Remove DepotDownloader artifacts from the game directory."""
+    # .DepotDownloader config directory
+    dd_dir = os.path.join(install_dir, ".DepotDownloader")
+    if os.path.isdir(dd_dir):
+        try:
+            shutil.rmtree(dd_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    # .manifest files in the game root
+    try:
+        for fname in os.listdir(install_dir):
+            if fname.endswith(".manifest"):
+                os.remove(os.path.join(install_dir, fname))
+    except Exception:
+        pass
+
+
+def _is_dd_artifact(rel_path: str) -> bool:
+    """Check if a relative path is a DepotDownloader artifact, not a game file."""
+    parts = rel_path.replace("\\", "/").split("/")
+    # .DepotDownloader/ config directory
+    if parts[0] == ".DepotDownloader":
+        return True
+    # Manifest files left in the download root
+    if rel_path.endswith(".manifest"):
+        return True
+    return False
+
+
 def _merge_tree(src: str, dst: str):
     """
     Delete-then-move all files from src into dst.
-    Reports progress every 25 files.
+    Skips DepotDownloader artifacts (config dir, manifest files).
     """
     rel_files = []
     for dirpath, _, filenames in os.walk(src):
         rel = os.path.relpath(dirpath, src)
         for fname in filenames:
-            rel_files.append(
-                fname if rel == "." else os.path.join(rel, fname)
-            )
+            rf = fname if rel == "." else os.path.join(rel, fname)
+            if not _is_dd_artifact(rf):
+                rel_files.append(rf)
 
     total = len(rel_files)
     if total == 0:
@@ -529,10 +547,9 @@ def _merge_tree(src: str, dst: str):
                 deleted += 1
             except OSError:
                 pass
-        if i % 25 == 0 or i == total:
-            print(f"\r  {C.DIM}  ...  Removing old files... {i}/{total}{C.RESET}",
-                  end="", flush=True)
-    print()
+        if i % 10 == 0 or i == total:
+            progress_bar(i / total * 100.0, label="Removing old files")
+    progress_bar_done(f"Removed {deleted} old files.")
 
     # Phase 2: move staged files into place
     for i, rf in enumerate(rel_files, 1):
@@ -540,85 +557,9 @@ def _merge_tree(src: str, dst: str):
         dst_file = os.path.join(dst, rf)
         os.makedirs(os.path.dirname(dst_file), exist_ok=True)
         shutil.move(src_file, dst_file)
-        if i % 25 == 0 or i == total:
-            print(f"\r  {C.DIM}  ...  Moving files... {i}/{total}{C.RESET}",
-                  end="", flush=True)
-    print()
-
-
-# ── Manual Steam console path ───────────────────────────────────────────────
-
-def run_manual_path(steam_root: str, install_dir: str):
-    """
-    Walk the user through the manual Steam console download_depot path.
-    No DepotDownloader needed — uses Steam's built-in console.
-    """
-    print()
-    info("Manual download via Steam console.")
-    print()
-    print(f"  {C.BOLD}You need to run these two commands in the Steam console.{C.RESET}")
-    print(f"  Steam will download the 32-bit depot files to its internal staging area.")
-    print()
-
-    for i, cmd in enumerate(IW5_DEPOT_CMDS, 1):
-        print(f"  {C.CYAN}Command {i}:{C.RESET}  {C.BOLD}{cmd}{C.RESET}")
-    print()
-
-    # Offer to open Steam console
-    if ask_yes_no("Open Steam console now?"):
-        try:
-            os.startfile("steam://open/console")
-            ok("Steam console opened. Switch to Steam and paste the commands.")
-        except Exception:
-            warn("Could not open Steam console. Open Steam, click Steam > Settings,")
-            warn("then type steam://open/console in the address bar.")
-
-    # Offer to copy commands to clipboard
-    if ask_yes_no("Copy the first command to clipboard?"):
-        if copy_to_clipboard(IW5_DEPOT_CMDS[0]):
-            ok("Copied. Paste it in the Steam console with Ctrl+V.")
-        else:
-            warn("Could not copy to clipboard. Copy it manually from above.")
-
-    print()
-    info("After pasting the first command, wait for it to finish.")
-    info("Then paste the second command.")
-    print()
-
-    if ask_yes_no("Copy the second command to clipboard?"):
-        if copy_to_clipboard(IW5_DEPOT_CMDS[1]):
-            ok("Copied.")
-
-    print()
-    info("When both downloads finish, press Enter here to continue.")
-    info(f"Steam stores the files under: {C.DIM}{steam_root}{C.RESET}")
-    press_enter("Press Enter when both depot downloads are complete...")
-
-    # Find staging dir
-    staging = find_manual_staging(steam_root)
-    if not staging:
-        fail("Could not find depot staging directory.")
-        fail("Expected location: <Steam>/steamapps/content/app_42680/")
-        fail("Check that both download_depot commands completed successfully.")
-        return False
-
-    ok(f"Found staging directory: {staging}")
-    return merge_depots(staging, install_dir)
-
-
-def find_manual_staging(steam_root: str) -> str | None:
-    """
-    Locate the depot staging directory after download_depot.
-    On Windows, Steam places files under steamapps/content/.
-    """
-    candidates = [
-        os.path.join(steam_root, "steamapps", "content",
-                     f"app_{IW5_APP_ID}"),
-    ]
-    for c in candidates:
-        if os.path.isdir(c):
-            return c
-    return None
+        if i % 10 == 0 or i == total:
+            progress_bar(i / total * 100.0, label="Moving files")
+    progress_bar_done(f"Moved {total} files into place.")
 
 
 # ── Main flow ────────────────────────────────────────────────────────────────
@@ -738,42 +679,10 @@ def downgrade_install(install_dir: str, steam_root: str) -> bool:
 
     ok("Sufficient disk space.")
 
-    # Choose download method
-    print()
-    print(f"  {C.BOLD}Choose a download method:{C.RESET}")
-    print()
-    print(f"    {C.CYAN}1{C.RESET}  Automated (QR code login via DepotDownloader)")
-    print(f"       Scan a QR code with the Steam Mobile App. Fastest option.")
-    print()
-    print(f"    {C.CYAN}2{C.RESET}  Manual (Steam console commands)")
-    print(f"       Paste two commands in the Steam console. No extra tools.")
-    print()
-
-    while True:
-        choice = input(f"  {C.YELLOW}  ?   Enter 1 or 2:{C.RESET} ").strip()
-        if choice in ("1", "2"):
-            break
-
-    if choice == "2":
-        success = run_manual_path(steam_root, install_dir)
-        if success:
-            print()
-            ok(f"{C.GREEN}{C.BOLD}MW3 downgraded to 32-bit successfully!{C.RESET}")
-            ok("You can now use Plutonium.")
-        else:
-            fail("Downgrade did not complete. See errors above.")
-        return success
-
-    # Automated path via DepotDownloader
+    # Locate bundled DepotDownloader
     dd_path = get_depot_downloader_path()
     if not dd_path:
-        warn("Falling back to manual method.")
-        success = run_manual_path(steam_root, install_dir)
-        if success:
-            print()
-            ok(f"{C.GREEN}{C.BOLD}MW3 downgraded to 32-bit successfully!{C.RESET}")
-            ok("You can now use Plutonium.")
-        return success
+        return False
 
     ok(f"DepotDownloader ready: {os.path.basename(dd_path)}")
 
@@ -799,7 +708,6 @@ def downgrade_install(install_dir: str, steam_root: str) -> bool:
         )
         if result is None:
             fail(f"Failed to download depot {depot_info['depot']}.")
-            fail("You can try the manual method instead (option 2).")
             # Cleanup partial staging
             if os.path.isdir(staging_dir):
                 shutil.rmtree(staging_dir, ignore_errors=True)
