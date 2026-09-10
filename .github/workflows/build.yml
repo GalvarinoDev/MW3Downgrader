@@ -26,13 +26,17 @@ jobs:
         shell: pwsh
         run: |
           $release = Invoke-RestMethod -Uri "https://api.github.com/repos/SteamRE/DepotDownloader/releases/latest"
-          $asset = $release.assets | Where-Object { $_.name -like "*win-x64*" } | Select-Object -First 1
-          if (-not $asset) { throw "Could not find win-x64 asset" }
+          Write-Host "Release: $($release.tag_name)"
+          Write-Host "Assets found:"
+          $release.assets | ForEach-Object { Write-Host "  - $($_.name)" }
+          $asset = $release.assets | Where-Object { $_.name -match "windows.*x64" -or $_.name -match "win.*x64" } | Select-Object -First 1
+          if (-not $asset) { throw "Could not find Windows x64 asset. See asset list above." }
           Write-Host "Downloading $($asset.name)..."
           Invoke-WebRequest -Uri $asset.browser_download_url -OutFile "dd.zip"
           Expand-Archive -Path "dd.zip" -DestinationPath "dd_extracted"
-          Copy-Item "dd_extracted\DepotDownloader.exe" -Destination "."
-          if (-not (Test-Path "DepotDownloader.exe")) { throw "DepotDownloader.exe not found after extraction" }
+          $exe = Get-ChildItem -Path "dd_extracted" -Filter "DepotDownloader.exe" -Recurse | Select-Object -First 1
+          if (-not $exe) { throw "DepotDownloader.exe not found after extraction" }
+          Copy-Item $exe.FullName -Destination "."
           Write-Host "DepotDownloader.exe ready"
 
       - name: Build exe
