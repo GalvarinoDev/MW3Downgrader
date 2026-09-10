@@ -18,13 +18,11 @@ import re
 import shutil
 import subprocess
 import sys
-import textwrap
-import time
 import winreg
 
 # ── Version ──────────────────────────────────────────────────────────────────
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 # ── ANSI colors (Windows 10+ Terminal) ───────────────────────────────────────
 
@@ -54,18 +52,50 @@ class C:
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-IW5_APP_ID = 42680  # MW3 base app
-
 # Appids to search for (MP and Dedicated Server)
 IW5_APPIDS = {
     "42690": "Multiplayer",
     "42750": "Dedicated Server",
 }
 
-IW5_DEPOTS = (
-    {"depot": 42682, "manifest": "2661317971072643596"},
-    {"depot": 42683, "manifest": "1595601894688570808"},
+# Depot plans per ownership type.
+# Each entry: (app_id_for_download, depot_id, manifest_id)
+#
+# Shared depots 42682/42683 exist under both 42690 and 42750 on Steam
+# (confirmed via SteamDB). Using the detected app as the -app flag
+# ensures DepotDownloader resolves the license correctly for users
+# who only own one of the two.
+#
+# 42691 = MP binaries (only in 42690)
+# 42751 = DS binaries (only in 42750)
+
+_DEPOTS_MP = (
+    {"app": 42690, "depot": 42682, "manifest": "2661317971072643596"},
+    {"app": 42690, "depot": 42683, "manifest": "1595601894688570808"},
+    {"app": 42690, "depot": 42691, "manifest": "4104640605720756125"},
 )
+
+_DEPOTS_DS = (
+    {"app": 42750, "depot": 42682, "manifest": "2661317971072643596"},
+    {"app": 42750, "depot": 42683, "manifest": "1595601894688570808"},
+    {"app": 42750, "depot": 42751, "manifest": "9089183337461621316"},
+)
+
+# Fallback when the install path is entered manually and we don't
+# know which app the user owns. Uses 42690 (MP) as the broadest bet.
+_DEPOTS_MANUAL = (
+    {"app": 42690, "depot": 42682, "manifest": "2661317971072643596"},
+    {"app": 42690, "depot": 42683, "manifest": "1595601894688570808"},
+)
+
+
+def get_depot_plan(appid: str) -> tuple[dict, ...]:
+    """Return the depot download plan for the detected appid."""
+    if appid == "42750":
+        return _DEPOTS_DS
+    if appid == "42690":
+        return _DEPOTS_MP
+    return _DEPOTS_MANUAL
 
 
 # Detection: main/iw_00.iwd size threshold
@@ -346,16 +376,19 @@ def run_depot_download(
     """
     Run DepotDownloader for a single depot with QR authentication.
     Returns the captured username on success, None on failure.
-    Retries automatically when QR expires.
+    Retries automatically when QR expires, but surfaces real errors
+    (access denied, 401, missing manifest) instead of misdiagnosing
+    them as QR expiry.
     """
     os.makedirs(staging_dir, exist_ok=True)
     attempt = 0
+    max_qr_retries = 5
 
     while True:
         attempt += 1
         cmd = [
             dd_path,
-            "-app", str(IW5_APP_ID),
+            "-app", str(depot_info["app"]),
             "-depot", str(depot_info["depot"]),
             "-manifest", depot_info["manifest"],
             "-dir", staging_dir,
@@ -370,10 +403,12 @@ def run_depot_download(
         if attempt > 1:
             info(f"Retrying QR login (attempt {attempt})...")
         else:
-            info(f"Downloading depot {depot_info['depot']}...")
+            info(f"Downloading depot {depot_info['depot']} (app {depot_info['app']})...")
 
         captured_username = None
         auth_succeeded = False
+        error_lines = []
+        got_qr_refresh = False
 
         try:
             proc = subprocess.Popen(
@@ -398,6 +433,7 @@ def run_depot_download(
                     "Use the Steam Mobile App" in line
                 ):
                     reading_qr = True
+                    got_qr_refresh = True
                     qr_lines = []
                     # Clear previous QR from console
                     print()
@@ -405,7 +441,7 @@ def run_depot_download(
                     print()
                     continue
 
-                # QR code content — print directly to console
+                # QR code content
                 if reading_qr:
                     if _is_qr_line(line):
                         qr_lines.append(line)
@@ -429,13 +465,20 @@ def run_depot_download(
                 if "Got depot key" in line:
                     progress(f"Downloading depot {depot_info['depot']}...")
                 elif "%" in line:
-                    # Extract percentage from DepotDownloader output
                     pct_match = re.search(r"([\d.]+)\s*%", line)
                     if pct_match:
                         pct = float(pct_match.group(1))
                         progress_bar(pct, label=f"Depot {depot_info['depot']}")
                 elif "Total downloaded" in line or "already" in line.lower():
                     progress_bar_done(line.strip())
+                else:
+                    # Capture lines that might be error messages from
+                    # DepotDownloader (access denied, 401, license
+                    # failures, etc.) so we can surface them instead
+                    # of silently retrying.
+                    stripped = line.strip()
+                    if stripped and not _is_qr_line(line):
+                        error_lines.append(stripped)
 
             proc.wait()
 
@@ -444,12 +487,48 @@ def run_depot_download(
                 progress_bar_done(f"Depot {depot_info['depot']} download complete.")
                 return captured_username or username
 
-            # Remembered credentials failed — don't retry
+            # Remembered credentials failed
             if username:
                 fail(f"DepotDownloader exited with code {proc.returncode}")
+                if error_lines:
+                    fail("DepotDownloader output:")
+                    for el in error_lines[-10:]:
+                        print(f"         {C.DIM}{el}{C.RESET}")
                 return None
 
-            # QR expired — loop to get a fresh one
+            # Check if there was a real error after auth succeeded
+            # (e.g. 401, access denied, missing manifest).
+            # If so, don't retry QR; the problem isn't authentication.
+            _error_keywords = (
+                "401", "access denied", "aborting",
+                "result: 0", "no manifest request code",
+                "unable to download", "not completely downloaded",
+                "not available", "could not get depot key",
+            )
+            real_error = False
+            for el in error_lines:
+                if any(kw in el.lower() for kw in _error_keywords):
+                    real_error = True
+                    break
+
+            if real_error or (auth_succeeded and proc.returncode != 0):
+                fail(f"DepotDownloader failed (exit code {proc.returncode}).")
+                if error_lines:
+                    fail("DepotDownloader output:")
+                    for el in error_lines[-10:]:
+                        print(f"         {C.DIM}{el}{C.RESET}")
+                if auth_succeeded:
+                    fail("Authentication succeeded but the download was denied.")
+                    fail("This may mean your Steam account does not own the")
+                    fail("required depot files. Check that you own MW3 Multiplayer")
+                    fail("(appid 42690) or Dedicated Server (appid 42750) on Steam.")
+                return None
+
+            # Genuine QR expiry: no auth, no real errors, QR was shown
+            if attempt >= max_qr_retries:
+                fail(f"QR login failed after {max_qr_retries} attempts.")
+                return None
+
             warn("QR code expired. Generating a new one...")
 
         except FileNotFoundError:
@@ -604,6 +683,7 @@ def main():
 
     if len(installs) == 1:
         install_dir = installs[0]["install_dir"]
+        appid = installs[0]["appid"]
         ok(f"MW3 {installs[0]['label']} found: {install_dir}")
     else:
         # Multiple installs found, let user pick
@@ -638,7 +718,7 @@ def main():
                 print()
                 info(f"Processing {inst['label']} ({inst['appid']})...")
                 ok(f"Install dir: {inst['install_dir']}")
-                result = downgrade_install(inst["install_dir"], steam_root)
+                result = downgrade_install(inst["install_dir"], inst["appid"], steam_root)
                 if not result:
                     fail(f"Failed to downgrade {inst['label']}.")
             press_enter("Press Enter to exit...")
@@ -646,15 +726,16 @@ def main():
         else:
             idx = int(pick) - 1
             install_dir = installs[idx]["install_dir"]
+            appid = installs[idx]["appid"]
             ok(f"MW3 {installs[idx]['label']} selected: {install_dir}")
 
     # Run the downgrade
-    success = downgrade_install(install_dir, steam_root)
+    success = downgrade_install(install_dir, appid, steam_root)
     press_enter("Press Enter to exit...")
     return 0 if success else 1
 
 
-def downgrade_install(install_dir: str, steam_root: str) -> bool:
+def downgrade_install(install_dir: str, appid: str, steam_root: str) -> bool:
     """
     Run the full downgrade flow for a single MW3 install directory.
     Returns True on success, False on failure.
@@ -686,6 +767,16 @@ def downgrade_install(install_dir: str, steam_root: str) -> bool:
 
     ok(f"DepotDownloader ready: {os.path.basename(dd_path)}")
 
+    # Build depot plan based on detected ownership
+    depot_plan = get_depot_plan(appid)
+    if appid == "42750":
+        info("Detected: Dedicated Server install (appid 42750)")
+    elif appid == "42690":
+        info("Detected: Multiplayer install (appid 42690)")
+    else:
+        info("Manual path: using default depot set")
+    info(f"Depots to download: {len(depot_plan)}")
+
     # Staging directory next to the game install
     staging_dir = os.path.join(
         os.path.dirname(install_dir),
@@ -698,11 +789,11 @@ def downgrade_install(install_dir: str, steam_root: str) -> bool:
     info("(Your login session is only used to download MW3 depot files.)")
     press_enter()
 
-    # Download both depots
+    # Download depots
     username = None
-    for i, depot_info in enumerate(IW5_DEPOTS):
+    for i, depot_info in enumerate(depot_plan):
         print()
-        info(f"Depot {i + 1} of {len(IW5_DEPOTS)}: {depot_info['depot']}")
+        info(f"Depot {i + 1} of {len(depot_plan)}: {depot_info['depot']}")
         result = run_depot_download(
             dd_path, staging_dir, depot_info, username=username,
         )
@@ -712,7 +803,7 @@ def downgrade_install(install_dir: str, steam_root: str) -> bool:
             if os.path.isdir(staging_dir):
                 shutil.rmtree(staging_dir, ignore_errors=True)
             return False
-        # Remember username for second depot (skip QR)
+        # Remember username for subsequent depots (skip QR)
         username = result
 
     # Merge

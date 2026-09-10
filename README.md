@@ -24,7 +24,12 @@ Windows 10 and 11 only. No Python or other software required.
 
 The tool checks the size of `main/iw_00.iwd` in your MW3 directory. The 64-bit version is about 420 MB. The 32-bit version is about 314 MB. If the file is above 380 MB, the install needs downgrading.
 
-It then downloads two Steam depots (42682 and 42683) at their last known 32-bit manifest versions. These are the same files Steam would give you if you could roll back the update yourself.
+It then detects whether you have MW3 Multiplayer (appid 42690) or the Dedicated Server (appid 42750) installed, and downloads the correct depot set for your install type:
+
+- **Multiplayer**: depots 42682 (base), 42683 (English), 42691 (MP binaries)
+- **Dedicated Server**: depots 42682 (base), 42683 (English), 42751 (DS binaries)
+
+The depots are downloaded at their last known 32-bit manifest versions. These are the same files Steam would give you if you could roll back the update yourself.
 
 After download, the tool deletes the old 64-bit files and moves the 32-bit replacements into place.
 
