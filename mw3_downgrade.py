@@ -22,7 +22,7 @@ import winreg
 
 # ── Version ──────────────────────────────────────────────────────────────────
 
-VERSION = "1.0.1"
+VERSION = "1.0.4"
 
 # ── ANSI colors (Windows 10+ Terminal) ───────────────────────────────────────
 
@@ -849,6 +849,40 @@ def main():
     return 0 if success else 1
 
 
+def _offer_ds_install(current_appid: str):
+    """
+    Offer to install the free MW3 Dedicated Server app on Steam
+    as a fallback when depot downloads fail. This gives the user
+    access to the shared depots under appid 42750, which can
+    resolve license/entitlement issues.
+
+    Only offered if the user doesn't already have the DS installed.
+    """
+    if current_appid == "42750":
+        # Already using DS, this won't help
+        return
+
+    print()
+    info("If the download keeps failing, installing the free MW3")
+    info("Dedicated Server on Steam may resolve the issue.")
+    print()
+    if ask_yes_no("Open Steam to install MW3 Dedicated Server (free)?",
+                  default=False):
+        try:
+            os.startfile("steam://install/42750")
+            print()
+            ok("Steam should be opening the install dialog.")
+            info("Let the Dedicated Server fully download, then")
+            info("run this tool again.")
+        except Exception:
+            print()
+            info("Could not open Steam automatically.")
+            info("You can install it manually by searching for")
+            info("'Call of Duty Modern Warfare 3 Dedicated Server'")
+            info("in your Steam library, or by opening this link:")
+            info("  steam://install/42750")
+
+
 def downgrade_install(install_dir: str, appid: str, steam_root: str) -> bool:
     """
     Run the full downgrade flow for a single MW3 install directory.
@@ -935,6 +969,11 @@ def downgrade_install(install_dir: str, appid: str, steam_root: str) -> bool:
             # Cleanup partial staging
             if os.path.isdir(staging_dir):
                 shutil.rmtree(staging_dir, ignore_errors=True)
+            # Offer to install MW3 Dedicated Server as a fallback.
+            # The DS app is free on Steam and gives access to the
+            # shared depots (42682/42683) under a different app ID,
+            # which can resolve license/entitlement failures.
+            _offer_ds_install(appid)
             return False
         # Remember username for subsequent depots (skip QR)
         username = result
