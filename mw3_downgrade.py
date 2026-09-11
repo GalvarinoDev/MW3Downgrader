@@ -52,10 +52,11 @@ class C:
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-# Appids to search for (MP and Dedicated Server)
+# Appids to search for (SP+MP base game, MP, and Dedicated Server)
 IW5_APPIDS = {
     "42690": "Multiplayer",
     "42750": "Dedicated Server",
+    "42680": "Call of Duty: Modern Warfare 3",
 }
 
 # Depot plans per ownership type.
@@ -66,18 +67,20 @@ IW5_APPIDS = {
 # ensures DepotDownloader resolves the license correctly for users
 # who only own one of the two.
 #
+# 42681 = SP binaries (in 42680; MW3 owners get both SP and MP)
 # 42691 = MP binaries (only in 42690)
 # 42751 = DS binaries (only in 42750)
 
 _DEPOTS_MP = (
     {"app": 42690, "depot": 42682, "manifest": "2661317971072643596"},
-    {"app": 42690, "depot": 42683, "manifest": "1595601894688570808"},
+    {"app": 42690, "depot": 42683, "manifest": "1595601894688570808"},  # language slot
+    {"app": 42680, "depot": 42681, "manifest": "5651167211650965131"},
     {"app": 42690, "depot": 42691, "manifest": "4104640605720756125"},
 )
 
 _DEPOTS_DS = (
     {"app": 42750, "depot": 42682, "manifest": "2661317971072643596"},
-    {"app": 42750, "depot": 42683, "manifest": "1595601894688570808"},
+    {"app": 42750, "depot": 42683, "manifest": "1595601894688570808"},  # language slot
     {"app": 42750, "depot": 42751, "manifest": "9089183337461621316"},
 )
 
@@ -85,17 +88,71 @@ _DEPOTS_DS = (
 # know which app the user owns. Uses 42690 (MP) as the broadest bet.
 _DEPOTS_MANUAL = (
     {"app": 42690, "depot": 42682, "manifest": "2661317971072643596"},
-    {"app": 42690, "depot": 42683, "manifest": "1595601894688570808"},
+    {"app": 42690, "depot": 42683, "manifest": "1595601894688570808"},  # language slot
 )
 
+# Language depots. The depot ID and manifest change per language;
+# the app ID is set at runtime based on ownership (42690 or 42750).
+# English (42683) is the default and is already in the base plans.
+IW5_LANGUAGES = {
+    "1": {"name": "English",  "depot": 42683, "manifest": "1595601894688570808"},
+    "2": {"name": "Spanish",  "depot": 42684, "manifest": "2897345196099821819"},
+    "3": {"name": "German",   "depot": 42685, "manifest": "1934757878507421371"},
+    "4": {"name": "French",   "depot": 42686, "manifest": "7270424907870526698"},
+    "5": {"name": "Italian",  "depot": 42687, "manifest": "7337464168521481857"},
+    "6": {"name": "Russian",  "depot": 42688, "manifest": "5872940112953203418"},
+    "7": {"name": "Japanese", "depot": 42689, "manifest": "2918816197530142361"},
+    "8": {"name": "Polish",   "depot": 42692, "manifest": "7706916996646584447"},
+}
 
-def get_depot_plan(appid: str) -> tuple[dict, ...]:
-    """Return the depot download plan for the detected appid."""
+_LANG_DEPOT_DEFAULT = 42683  # English depot ID, used to find the slot to swap
+
+
+def ask_language() -> dict:
+    """Prompt the user to select a language. Returns the language dict."""
+    print()
+    info("Select language for game files:")
+    print()
+    for key, lang in IW5_LANGUAGES.items():
+        default = " (default)" if key == "1" else ""
+        print(f"    {C.CYAN}{key}{C.RESET}  {lang['name']}{default}")
+    print()
+
+    while True:
+        choice = input(f"  {C.YELLOW}  ?   Language [1]:{C.RESET} ").strip()
+        if choice == "":
+            return IW5_LANGUAGES["1"]
+        if choice in IW5_LANGUAGES:
+            return IW5_LANGUAGES[choice]
+
+
+def get_depot_plan(appid: str, language: dict | None = None) -> list[dict]:
+    """
+    Return the depot download plan for the detected appid.
+    If a language is provided, swaps the English language depot
+    for the selected one.
+    """
     if appid == "42750":
-        return _DEPOTS_DS
-    if appid == "42690":
-        return _DEPOTS_MP
-    return _DEPOTS_MANUAL
+        plan = list(_DEPOTS_DS)
+    elif appid in ("42690", "42680"):
+        # 42680 (base game) includes 42690 (MP), so both get the
+        # full SP+MP depot set.
+        plan = list(_DEPOTS_MP)
+    else:
+        plan = list(_DEPOTS_MANUAL)
+
+    # Swap language depot if not English
+    if language and language["depot"] != _LANG_DEPOT_DEFAULT:
+        for i, entry in enumerate(plan):
+            if entry["depot"] == _LANG_DEPOT_DEFAULT:
+                plan[i] = {
+                    "app": entry["app"],
+                    "depot": language["depot"],
+                    "manifest": language["manifest"],
+                }
+                break
+
+    return plan
 
 
 # Detection: main/iw_00.iwd size threshold
@@ -272,51 +329,101 @@ def find_library_dirs(steam_root: str) -> list[str]:
 def find_mw3_installs(steam_root: str) -> list[dict]:
     """
     Locate all MW3 install directories across all Steam libraries.
-    Checks for both Multiplayer (42690) and Dedicated Server (42750).
+    Checks for MW3 base game (42680), Multiplayer (42690), and
+    Dedicated Server (42750).
     Returns a list of dicts with 'appid', 'label', and 'install_dir'.
+
+    Primary method: appmanifest ACF files in Steam library folders.
+    Fallback: Windows registry keys written by Steam per app.
     """
     library_dirs = find_library_dirs(steam_root)
-    if not library_dirs:
-        return []
-
     found = []
     seen_dirs = set()
 
+    # Primary: scan appmanifest ACF files
+    if library_dirs:
+        for appid, label in IW5_APPIDS.items():
+            for steamapps_dir in library_dirs:
+                acf = os.path.join(steamapps_dir, f"appmanifest_{appid}.acf")
+                if not os.path.isfile(acf):
+                    continue
+
+                install_name = None
+                state_flags = None
+                try:
+                    with open(acf, "r", encoding="utf-8", errors="replace") as f:
+                        for line in f:
+                            m = re.search(r'"installdir"\s+"([^"]+)"', line)
+                            if m:
+                                install_name = m.group(1)
+                            m = re.search(r'"StateFlags"\s+"(\d+)"', line)
+                            if m:
+                                state_flags = m.group(1)
+                            if install_name and state_flags:
+                                break
+                except Exception:
+                    continue
+
+                if not install_name or state_flags != "4":
+                    continue
+
+                install_dir = os.path.join(steamapps_dir, "common", install_name)
+                norm = os.path.normpath(install_dir).lower()
+                if os.path.isdir(install_dir) and norm not in seen_dirs:
+                    seen_dirs.add(norm)
+                    found.append({
+                        "appid": appid,
+                        "label": label,
+                        "install_dir": install_dir,
+                    })
+                    break  # found this appid, move to next
+
+    # Fallback: check Windows registry for install locations.
+    # Steam writes an Uninstall key per app with InstallLocation.
+    if not found:
+        found = _find_mw3_installs_registry(seen_dirs)
+
+    return found
+
+
+def _find_mw3_installs_registry(seen_dirs: set) -> list[dict]:
+    """
+    Fallback detection via Windows registry.
+    Steam writes keys at:
+      HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Steam App XXXXX
+    with an InstallLocation value pointing to the game directory.
+    """
+    found = []
+
     for appid, label in IW5_APPIDS.items():
-        for steamapps_dir in library_dirs:
-            acf = os.path.join(steamapps_dir, f"appmanifest_{appid}.acf")
-            if not os.path.isfile(acf):
+        key_path = (
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+            rf"\Steam App {appid}"
+        )
+        try:
+            key = winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                key_path,
+                0,
+                winreg.KEY_READ | winreg.KEY_WOW64_32KEY,
+            )
+            install_dir, _ = winreg.QueryValueEx(key, "InstallLocation")
+            winreg.CloseKey(key)
+
+            if not install_dir:
                 continue
 
-            install_name = None
-            state_flags = None
-            try:
-                with open(acf, "r", encoding="utf-8", errors="replace") as f:
-                    for line in f:
-                        m = re.search(r'"installdir"\s+"([^"]+)"', line)
-                        if m:
-                            install_name = m.group(1)
-                        m = re.search(r'"StateFlags"\s+"(\d+)"', line)
-                        if m:
-                            state_flags = m.group(1)
-                        if install_name and state_flags:
-                            break
-            except Exception:
-                continue
-
-            if not install_name or state_flags != "4":
-                continue
-
-            install_dir = os.path.join(steamapps_dir, "common", install_name)
-            norm = os.path.normpath(install_dir).lower()
+            install_dir = os.path.normpath(install_dir)
+            norm = install_dir.lower()
             if os.path.isdir(install_dir) and norm not in seen_dirs:
                 seen_dirs.add(norm)
                 found.append({
                     "appid": appid,
-                    "label": label,
+                    "label": f"{label} (registry)",
                     "install_dir": install_dir,
                 })
-                break  # found this appid, move to next
+        except (OSError, FileNotFoundError):
+            continue
 
     return found
 
@@ -767,12 +874,21 @@ def downgrade_install(install_dir: str, appid: str, steam_root: str) -> bool:
 
     ok(f"DepotDownloader ready: {os.path.basename(dd_path)}")
 
-    # Build depot plan based on detected ownership
-    depot_plan = get_depot_plan(appid)
+    # Select language
+    language = ask_language()
+    if language["name"] != "English":
+        ok(f"Language: {language['name']} (depot {language['depot']})")
+    else:
+        ok("Language: English")
+
+    # Build depot plan based on detected ownership and language
+    depot_plan = get_depot_plan(appid, language)
     if appid == "42750":
         info("Detected: Dedicated Server install (appid 42750)")
     elif appid == "42690":
         info("Detected: Multiplayer install (appid 42690)")
+    elif appid == "42680":
+        info("Detected: MW3 base game install (appid 42680)")
     else:
         info("Manual path: using default depot set")
     info(f"Depots to download: {len(depot_plan)}")
