@@ -67,16 +67,17 @@ IW5_APPIDS = {
 # ensures DepotDownloader resolves the license correctly for users
 # who only own one of the two.
 #
-# 42681 = SP binaries (in 42680; MW3 owners get both SP and MP)
+# 42681 = SP binaries (in 42680; optional, MW3 owners get both SP and MP)
 # 42691 = MP binaries (only in 42690)
 # 42751 = DS binaries (only in 42750)
 
 _DEPOTS_MP = (
     {"app": 42690, "depot": 42682, "manifest": "2661317971072643596"},
     {"app": 42690, "depot": 42683, "manifest": "1595601894688570808"},  # language slot
-    {"app": 42680, "depot": 42681, "manifest": "5651167211650965131"},
     {"app": 42690, "depot": 42691, "manifest": "4104640605720756125"},
 )
+
+_DEPOT_SP = {"app": 42680, "depot": 42681, "manifest": "5651167211650965131"}
 
 _DEPOTS_DS = (
     {"app": 42750, "depot": 42682, "manifest": "2661317971072643596"},
@@ -126,11 +127,13 @@ def ask_language() -> dict:
             return IW5_LANGUAGES[choice]
 
 
-def get_depot_plan(appid: str, language: dict | None = None) -> list[dict]:
+def get_depot_plan(appid: str, language: dict | None = None,
+                   include_sp: bool = False) -> list[dict]:
     """
     Return the depot download plan for the detected appid.
     If a language is provided, swaps the English language depot
-    for the selected one.
+    for the selected one. If include_sp is True and the user owns
+    the base game (42680/42690), adds the SP binaries depot.
     """
     if appid == "42750":
         plan = list(_DEPOTS_DS)
@@ -140,6 +143,10 @@ def get_depot_plan(appid: str, language: dict | None = None) -> list[dict]:
         plan = list(_DEPOTS_MP)
     else:
         plan = list(_DEPOTS_MANUAL)
+
+    # Add SP binaries if requested (only for MW3/MP owners, not DS)
+    if include_sp and appid in ("42690", "42680"):
+        plan.append(dict(_DEPOT_SP))
 
     # Swap language depot if not English
     if language and language["depot"] != _LANG_DEPOT_DEFAULT:
@@ -874,6 +881,16 @@ def downgrade_install(install_dir: str, appid: str, steam_root: str) -> bool:
 
     ok(f"DepotDownloader ready: {os.path.basename(dd_path)}")
 
+    # Ask about optional SP files (only relevant for MW3/MP owners)
+    include_sp = False
+    if appid in ("42690", "42680"):
+        print()
+        include_sp = ask_yes_no("Also restore singleplayer files?", default=False)
+        if include_sp:
+            ok("Singleplayer files will be included.")
+        else:
+            ok("Skipping singleplayer files (multiplayer only).")
+
     # Select language
     language = ask_language()
     if language["name"] != "English":
@@ -881,8 +898,8 @@ def downgrade_install(install_dir: str, appid: str, steam_root: str) -> bool:
     else:
         ok("Language: English")
 
-    # Build depot plan based on detected ownership and language
-    depot_plan = get_depot_plan(appid, language)
+    # Build depot plan based on detected ownership, language, and SP choice
+    depot_plan = get_depot_plan(appid, language, include_sp)
     if appid == "42750":
         info("Detected: Dedicated Server install (appid 42750)")
     elif appid == "42690":
