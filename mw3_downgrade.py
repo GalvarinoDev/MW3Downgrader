@@ -22,7 +22,7 @@ import winreg
 
 # ── Version ──────────────────────────────────────────────────────────────────
 
-VERSION = "1.0.4"
+VERSION = "1.1.0"
 
 # ── ANSI colors (Windows 10+ Terminal) ───────────────────────────────────────
 
@@ -108,6 +108,74 @@ IW5_LANGUAGES = {
 
 _LANG_DEPOT_DEFAULT = 42683  # English depot ID, used to find the slot to swap
 
+# DLC depots. Each Collection is a separate paid Steam product whose
+# content lives in a single depot under app 42690. DepotDownloader
+# will only succeed if the authenticated account owns that DLC.
+#
+# Detection uses one .ff file per collection in zone/dlc/. If the
+# file is missing or its size doesn't match, the collection needs
+# downloading. No user prompt required.
+#
+# Depot/manifest IDs from the Alterware/Plutonium depot reference:
+#   https://gist.github.com/Josu-A/b3698ee46b66225401a5583044f5789a
+# Map codename mappings confirmed via AlterWare Plutonium mapvote
+# configs, Se7enSins console command reference, and CoD Fandom wiki.
+IW5_DLC = {
+    "1": {
+        "name": "Collection 1",
+        "app": 42690, "depot": 42695,
+        "manifest": "9005316271397236436",
+        "marker": os.path.join("zone", "dlc", "mp_overwatch.ff"),
+        "marker_size": 77324309,
+    },
+    "2": {
+        "name": "Collection 2",
+        "app": 42690, "depot": 42696,
+        "manifest": "2478272765185873756",
+        "marker": os.path.join("zone", "dlc", "mp_cement.ff"),
+        "marker_size": 94543893,
+    },
+    "3": {
+        "name": "Collection 3 (Chaos Pack)",
+        "app": 42690, "depot": 42697,
+        "manifest": "5810618727794750362",
+        "marker": os.path.join("zone", "dlc", "mp_crosswalk_ss.ff"),
+        "marker_size": 74227733,
+    },
+    "4": {
+        "name": "Collection 4 (Final Assault)",
+        "app": 42690, "depot": 42698,
+        "manifest": "5997898371746217629",
+        "marker": os.path.join("zone", "dlc", "mp_shipbreaker.ff"),
+        "marker_size": 80756757,
+    },
+}
+
+
+def detect_dlc_status(install_dir: str) -> dict:
+    """
+    Check each DLC collection's marker file in the install directory.
+    Returns a dict keyed by collection number ("1".."4") with values:
+      "ok"      - marker present and correct size
+      "missing" - marker file does not exist
+      "wrong"   - marker exists but size doesn't match
+    """
+    status = {}
+    for key, dlc in IW5_DLC.items():
+        marker_path = os.path.join(install_dir, dlc["marker"])
+        if not os.path.isfile(marker_path):
+            status[key] = "missing"
+        else:
+            try:
+                actual = os.path.getsize(marker_path)
+                if actual == dlc["marker_size"]:
+                    status[key] = "ok"
+                else:
+                    status[key] = "wrong"
+            except OSError:
+                status[key] = "missing"
+    return status
+
 
 def ask_language() -> dict:
     """Prompt the user to select a language. Returns the language dict."""
@@ -128,12 +196,14 @@ def ask_language() -> dict:
 
 
 def get_depot_plan(appid: str, language: dict | None = None,
-                   include_sp: bool = False) -> list[dict]:
+                   include_sp: bool = False,
+                   dlc_keys: list[str] | None = None) -> list[dict]:
     """
     Return the depot download plan for the detected appid.
     If a language is provided, swaps the English language depot
     for the selected one. If include_sp is True and the user owns
     the base game (42680/42690), adds the SP binaries depot.
+    If dlc_keys is provided, appends those DLC depot entries.
     """
     if appid == "42750":
         plan = list(_DEPOTS_DS)
@@ -158,6 +228,16 @@ def get_depot_plan(appid: str, language: dict | None = None,
                     "manifest": language["manifest"],
                 }
                 break
+
+    # Append DLC depots
+    if dlc_keys:
+        for key in dlc_keys:
+            dlc = IW5_DLC[key]
+            plan.append({
+                "app": dlc["app"],
+                "depot": dlc["depot"],
+                "manifest": dlc["manifest"],
+            })
 
     return plan
 
@@ -886,17 +966,60 @@ def _offer_ds_install(current_appid: str):
 def downgrade_install(install_dir: str, appid: str, steam_root: str) -> bool:
     """
     Run the full downgrade flow for a single MW3 install directory.
+    Two phases, both fully automatic:
+      1. Base-game 32-bit downgrade (skipped if already 32-bit).
+      2. DLC detection and download (checks marker file sizes on
+         disk, downloads any collection that is missing or wrong).
     Returns True on success, False on failure.
     """
-    # Check if downgrade is needed
+    needs_base_downgrade = False
+
+    # ── Phase 1: base-game bitness check ─────────────────────────
     info("Checking MW3 version...")
-    if not is_iw5_64bit(install_dir):
+    if is_iw5_64bit(install_dir):
+        needs_base_downgrade = True
+        warn("MW3 is 64-bit. Downgrade required for Plutonium.")
+    else:
         print()
-        ok("MW3 is already 32-bit. No downgrade needed.")
+        ok("MW3 is already 32-bit. No base-game downgrade needed.")
+
+    # ── Phase 2: DLC detection ───────────────────────────────────
+    dlc_keys = []
+    if appid != "manual":
+        print()
+        info("Checking DLC collections...")
+        dlc_status = detect_dlc_status(install_dir)
+        for key in sorted(dlc_status):
+            dlc = IW5_DLC[key]
+            st = dlc_status[key]
+            if st == "ok":
+                ok(f"{dlc['name']}: installed")
+            elif st == "missing":
+                warn(f"{dlc['name']}: not found")
+                dlc_keys.append(key)
+            else:
+                warn(f"{dlc['name']}: wrong version (size mismatch)")
+                dlc_keys.append(key)
+
+        if dlc_keys:
+            names = ", ".join(IW5_DLC[k]["name"] for k in dlc_keys)
+            print()
+            info(f"DLC to download: {names}")
+            info("Each DLC requires Steam ownership. Collections you do")
+            info("not own on Steam will fail to download (this is normal).")
+            if not ask_yes_no("Download missing/incorrect DLC?", default=True):
+                dlc_keys = []
+                ok("Skipping DLC.")
+        else:
+            ok("All DLC collections present and correct.")
+
+    # If nothing to do, exit early
+    if not needs_base_downgrade and not dlc_keys:
+        print()
         ok("Plutonium should work with this install.")
         return True
 
-    warn("MW3 is 64-bit. Downgrade required for Plutonium.")
+    # ── Common setup ─────────────────────────────────────────────
 
     # Check disk space
     free_gb = check_free_space_gb(install_dir)
@@ -915,25 +1038,40 @@ def downgrade_install(install_dir: str, appid: str, steam_root: str) -> bool:
 
     ok(f"DepotDownloader ready: {os.path.basename(dd_path)}")
 
-    # Ask about optional SP files (only relevant for MW3/MP owners)
+    # Build depot plan
     include_sp = False
-    if appid in ("42690", "42680"):
-        print()
-        include_sp = ask_yes_no("Also restore singleplayer files?", default=False)
-        if include_sp:
-            ok("Singleplayer files will be included.")
+    language = None
+    depot_plan = []
+
+    if needs_base_downgrade:
+        # Ask about optional SP files (only relevant for MW3/MP owners)
+        if appid in ("42690", "42680"):
+            print()
+            include_sp = ask_yes_no("Also restore singleplayer files?", default=False)
+            if include_sp:
+                ok("Singleplayer files will be included.")
+            else:
+                ok("Skipping singleplayer files (multiplayer only).")
+
+        # Select language
+        language = ask_language()
+        if language["name"] != "English":
+            ok(f"Language: {language['name']} (depot {language['depot']})")
         else:
-            ok("Skipping singleplayer files (multiplayer only).")
+            ok("Language: English")
 
-    # Select language
-    language = ask_language()
-    if language["name"] != "English":
-        ok(f"Language: {language['name']} (depot {language['depot']})")
+        depot_plan = get_depot_plan(appid, language, include_sp,
+                                    dlc_keys=dlc_keys)
     else:
-        ok("Language: English")
+        # DLC only (base already 32-bit)
+        for key in dlc_keys:
+            dlc = IW5_DLC[key]
+            depot_plan.append({
+                "app": dlc["app"],
+                "depot": dlc["depot"],
+                "manifest": dlc["manifest"],
+            })
 
-    # Build depot plan based on detected ownership, language, and SP choice
-    depot_plan = get_depot_plan(appid, language, include_sp)
     if appid == "42750":
         info("Detected: Dedicated Server install (appid 42750)")
     elif appid == "42690":
@@ -942,7 +1080,15 @@ def downgrade_install(install_dir: str, appid: str, steam_root: str) -> bool:
         info("Detected: MW3 base game install (appid 42680)")
     else:
         info("Manual path: using default depot set")
-    info(f"Depots to download: {len(depot_plan)}")
+
+    base_count = len(depot_plan) - len(dlc_keys)
+    parts = []
+    if base_count > 0:
+        parts.append(f"{base_count} base")
+    if dlc_keys:
+        dlc_names = ", ".join(IW5_DLC[k]["name"] for k in dlc_keys)
+        parts.append(f"{len(dlc_keys)} DLC ({dlc_names})")
+    info(f"Depots to download: {len(depot_plan)} ({', '.join(parts)})")
 
     # Staging directory next to the game install
     staging_dir = os.path.join(
@@ -956,45 +1102,70 @@ def downgrade_install(install_dir: str, appid: str, steam_root: str) -> bool:
     info("(Your login session is only used to download MW3 depot files.)")
     press_enter()
 
-    # Download depots
+    # ── Download depots ──────────────────────────────────────────
     username = None
     for i, depot_info in enumerate(depot_plan):
         print()
-        info(f"Depot {i + 1} of {len(depot_plan)}: {depot_info['depot']}")
+
+        # Label DLC depots by collection name
+        dlc_label = None
+        for dk, dv in IW5_DLC.items():
+            if dv["depot"] == depot_info["depot"]:
+                dlc_label = dv["name"]
+                break
+
+        if dlc_label:
+            info(f"Depot {i + 1} of {len(depot_plan)}: "
+                 f"{depot_info['depot']} ({dlc_label})")
+        else:
+            info(f"Depot {i + 1} of {len(depot_plan)}: "
+                 f"{depot_info['depot']}")
+
         result = run_depot_download(
             dd_path, staging_dir, depot_info, username=username,
         )
         if result is None:
             fail(f"Failed to download depot {depot_info['depot']}.")
+            if dlc_label:
+                fail(f"Could not download {dlc_label}. Your Steam account")
+                fail("may not own this DLC collection.")
             # Cleanup partial staging
             if os.path.isdir(staging_dir):
                 shutil.rmtree(staging_dir, ignore_errors=True)
-            # Offer to install MW3 Dedicated Server as a fallback.
-            # The DS app is free on Steam and gives access to the
-            # shared depots (42682/42683) under a different app ID,
-            # which can resolve license/entitlement failures.
-            _offer_ds_install(appid)
+            if not dlc_label:
+                _offer_ds_install(appid)
             return False
         # Remember username for subsequent depots (skip QR)
         username = result
 
-    # Merge
+    # ── Merge ────────────────────────────────────────────────────
     print()
     success = merge_depots(staging_dir, install_dir)
 
     if success:
-        # Verify
-        if not is_iw5_64bit(install_dir):
-            print()
-            print(f"  {C.GREEN}{C.BOLD}{'=' * 54}{C.RESET}")
-            print(f"  {C.GREEN}{C.BOLD}  MW3 downgraded to 32-bit successfully!{C.RESET}")
-            print(f"  {C.GREEN}{C.BOLD}  Plutonium should now work with this install.{C.RESET}")
-            print(f"  {C.GREEN}{C.BOLD}{'=' * 54}{C.RESET}")
+        if needs_base_downgrade:
+            # Verify base-game downgrade
+            if not is_iw5_64bit(install_dir):
+                print()
+                print(f"  {C.GREEN}{C.BOLD}{'=' * 54}{C.RESET}")
+                print(f"  {C.GREEN}{C.BOLD}  MW3 downgraded to 32-bit successfully!{C.RESET}")
+                if dlc_keys:
+                    names = ", ".join(IW5_DLC[k]["name"] for k in dlc_keys)
+                    print(f"  {C.GREEN}{C.BOLD}  DLC installed: {names}{C.RESET}")
+                print(f"  {C.GREEN}{C.BOLD}  Plutonium should now work with this install.{C.RESET}")
+                print(f"  {C.GREEN}{C.BOLD}{'=' * 54}{C.RESET}")
+            else:
+                warn("Merge completed but MW3 still appears to be 64-bit.")
+                warn("The marker file (main/iw_00.iwd) size has not changed.")
+                warn("Try verifying MW3 files in Steam, then run this tool again.")
+                return False
         else:
-            warn("Merge completed but MW3 still appears to be 64-bit.")
-            warn("The marker file (main/iw_00.iwd) size has not changed.")
-            warn("Try verifying MW3 files in Steam, then run this tool again.")
-            return False
+            # DLC-only install
+            print()
+            names = ", ".join(IW5_DLC[k]["name"] for k in dlc_keys)
+            print(f"  {C.GREEN}{C.BOLD}{'=' * 54}{C.RESET}")
+            print(f"  {C.GREEN}{C.BOLD}  DLC installed: {names}{C.RESET}")
+            print(f"  {C.GREEN}{C.BOLD}{'=' * 54}{C.RESET}")
     else:
         fail("Merge failed. See errors above.")
 
