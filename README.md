@@ -81,7 +81,7 @@ This is a false positive caused by unsigned PyInstaller executables. The source 
 Make sure MW3 (42680), MW3 Multiplayer (42690), or Dedicated Server (42750) is fully installed through Steam. The tool checks both appmanifest files and the Windows registry. If it still cannot find your install, it will ask if you want to enter the path manually.
 
 **A DLC download failed.**
-The most likely cause is that your Steam account does not own that DLC collection. Each collection (1 through 4) is a separate purchase on Steam. The tool will tell you which collection failed.
+The most likely cause is that your Steam account does not own that DLC collection. Each collection (1 through 4) is a separate purchase on Steam. The tool will tell you which collection failed. The base game and any DLC you do own are still installed.
 
 **The tool says a DLC has the wrong version.**
 This means the marker file exists but is a different size than expected. The tool will re-download that collection to replace it with the correct version.
