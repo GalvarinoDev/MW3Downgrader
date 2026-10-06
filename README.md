@@ -1,6 +1,6 @@
 # MW3 Downgrader
 
-Activision pushed a 64-bit update for Call of Duty: Modern Warfare 3 that breaks Plutonium compatibility. This tool detects the 64-bit install and replaces it with the correct 32-bit depot files so Plutonium works again.
+Activision pushed a 64-bit update for Call of Duty: Modern Warfare 3 that breaks Plutonium compatibility. This tool downloads the correct 32-bit depot files and points Plutonium at them. You can either replace the files in your Steam install, or (recommended) put them in a separate `downgrade` folder inside it. With the separate folder, the Steam install stays untouched, so Steam updates and "Verify integrity of game files" can't break Plutonium again.
 
 Also detects missing or incorrect DLC Collections 1 through 4 and downloads them automatically for users who own them on Steam.
 
@@ -15,15 +15,16 @@ Windows 10 and 11 only. No Python or other software required.
 1. Download `MW3_Downgrader.exe` from the [Releases](https://github.com/GalvarinoDev/MW3Downgrader/releases) page.
 2. Run the exe. Windows SmartScreen may show a warning because the file is unsigned. Click **More info**, then **Run anyway**.
 3. The tool finds your Steam and MW3 install automatically (base game, Multiplayer, Dedicated Server, or multiple).
-4. The tool checks whether the base game needs downgrading (64-bit to 32-bit).
+4. The tool checks whether MW3 needs downgrading (64-bit to 32-bit). If it does, it asks whether to install the 32-bit files to a separate `downgrade` folder (recommended, protects against Steam updates) or over the Steam install. If a `downgrade` folder already exists, it is used without asking.
 5. The tool scans for DLC Collections 1 through 4 by checking map file sizes on disk. Any collection that is missing or has incorrect files is flagged for download.
 6. If a base-game downgrade is needed, select your language (English is the default) and optionally include singleplayer files.
 7. A QR code appears in the console. Scan it with the Steam Mobile App to authenticate.
-8. The tool downloads all needed depot files (base game and/or DLC), merges them over your MW3 install, and verifies the result.
+8. The tool downloads all needed depot files (base game and/or DLC), merges them into the chosen folder, and verifies the result.
+9. The tool sets Plutonium's MW3 game folder to that folder (close Plutonium first).
 
 ## DLC support
 
-The tool automatically detects DLC by checking specific map files in your install:
+The tool automatically detects DLC by checking specific map files in the 32-bit game folder (the `downgrade` folder if you use one):
 
 - **Collection 1** (Liberation, Piazza, Overwatch, Black Box): checks `zone/dlc/mp_overwatch.ff`
 - **Collection 2** (Sanctuary, Foundation, Oasis + Face Off maps): checks `zone/dlc/mp_cement.ff`
@@ -39,15 +40,15 @@ You can run the tool on an already-downgraded (32-bit) install purely to fix DLC
 - MW3 (Steam appid 42680), MW3 Multiplayer (appid 42690), and/or Dedicated Server (appid 42750) installed
 - Steam Mobile App on your phone (for the automated QR method)
 - Steam ownership of each DLC collection you want to download
-- 15 GB of free disk space on the drive where MW3 is installed
+- 15 GB of free disk space on the drive where MW3 is installed (the separate `downgrade` folder keeps a full 32-bit copy next to the Steam install)
 
 ## How it works
 
-The tool checks the size of `main/iw_00.iwd` in your MW3 directory. The 64-bit version is about 420 MB. The 32-bit version is about 314 MB. If the file is above 380 MB, the install needs downgrading.
+The tool checks the size of `main/iw_00.iwd` (in the `downgrade` folder if one exists, otherwise in your MW3 directory). The 64-bit version is about 420 MB. The 32-bit version is about 314 MB. If the file is above 380 MB, the install needs downgrading.
 
 It then detects whether you have MW3 (appid 42680), Multiplayer (appid 42690), or the Dedicated Server (appid 42750) installed, and downloads the correct depot set for your install type:
 
-- **MW3 / Multiplayer**: depots 42682 (base), language depot, 42681 (SP binaries), 42691 (MP binaries)
+- **MW3 / Multiplayer / manual path**: depots 42682 (base), language depot, 42691 (MP binaries), optionally 42681 (SP binaries)
 - **Dedicated Server**: depots 42682 (base), language depot, 42751 (DS binaries)
 - **DLC Collection 1**: depot 42695
 - **DLC Collection 2**: depot 42696
@@ -60,12 +61,12 @@ Detection uses Steam's appmanifest files as the primary method, with a Windows r
 
 The depots are downloaded at their last known 32-bit manifest versions. These are the same files Steam would give you if you could roll back the update yourself.
 
-After download, the tool deletes the old 64-bit files and moves the 32-bit replacements into place.
+After download, the tool moves the 32-bit files into `<MW3>\downgrade`, or deletes the old 64-bit files and moves the 32-bit replacements into the Steam install. It then sets `iw5Path` in `%LOCALAPPDATA%\Plutonium\config.json` to that folder, keeping every other setting (including your Plutonium login). If the config doesn't exist yet, the tool prints the folder to select in the Plutonium launcher. For a Dedicated Server install, the path is only set if Plutonium has no MW3 folder yet.
 
 ## FAQ
 
 **Is this safe?**
-The tool only modifies files inside your MW3 install directory. It does not touch Steam, other games, or system files. If something goes wrong, verify MW3 file integrity through Steam to restore the original files.
+The tool only modifies files inside your MW3 install directory and the MW3 path in Plutonium's config. It does not touch Steam, other games, or system files. To undo the separate-folder install, delete the `downgrade` folder and set the MW3 folder in Plutonium back to your Steam install. To undo an in-place downgrade, verify MW3 file integrity through Steam.
 
 **Do I need to keep Steam open?**
 Steam does not need to be running. The tool uses its own downloader.
