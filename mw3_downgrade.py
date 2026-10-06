@@ -24,7 +24,7 @@ import winreg
 
 # ── Version ──────────────────────────────────────────────────────────────────
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # ── ANSI colors (Windows 10+ Terminal) ───────────────────────────────────────
 
@@ -454,7 +454,8 @@ def find_mw3_installs(steam_root: str) -> list[dict]:
                 except Exception:
                     continue
 
-                if not install_name or state_flags != "4":
+                # Bit 4 = fully installed (e.g. 6 = installed, update pending)
+                if not install_name or not (int(state_flags or 0) & 4):
                     continue
 
                 install_dir = os.path.join(steamapps_dir, "common", install_name)
@@ -646,10 +647,12 @@ def run_depot_download(
     staging_dir: str,
     depot_info: dict,
     username: str | None = None,
-) -> str | None:
+) -> tuple[bool, str | None]:
     """
     Run DepotDownloader for a single depot with QR authentication.
-    Returns the captured username on success, None on failure.
+    Returns (success, username). The username is kept when the login
+    worked but the download didn't (e.g. unowned DLC), so later depots
+    can skip the QR code.
     Retries automatically when QR expires, but surfaces real errors
     (access denied, 401, missing manifest) instead of misdiagnosing
     them as QR expiry.
@@ -683,6 +686,9 @@ def run_depot_download(
         auth_succeeded = False
         error_lines = []
         got_qr_refresh = False
+        # DepotDownloader exits 0 even when a depot is "not available
+        # from this account" (unowned DLC); it then reports 0 depots.
+        nothing_downloaded = False
 
         try:
             proc = subprocess.Popen(
@@ -744,7 +750,11 @@ def run_depot_download(
                         pct = float(pct_match.group(1))
                         progress_bar(pct, label=f"Depot {depot_info['depot']}")
                 elif "Total downloaded" in line or "already" in line.lower():
-                    progress_bar_done(line.strip())
+                    if "from 0 depots" in line:
+                        nothing_downloaded = True
+                        print()
+                    else:
+                        progress_bar_done(line.strip())
                 else:
                     # Capture lines that might be error messages from
                     # DepotDownloader (access denied, 401, license
@@ -756,10 +766,16 @@ def run_depot_download(
 
             proc.wait()
 
-            if proc.returncode == 0 and (auth_succeeded or username):
+            if (proc.returncode == 0 and (auth_succeeded or username)
+                    and not nothing_downloaded):
                 progress_bar(100.0, label=f"Depot {depot_info['depot']}")
                 progress_bar_done(f"Depot {depot_info['depot']} download complete.")
-                return captured_username or username
+                return True, captured_username or username
+
+            # Logged in, but this account doesn't own the depot
+            if nothing_downloaded:
+                fail(f"Depot {depot_info['depot']} is not available from this Steam account.")
+                return False, captured_username or username
 
             # Remembered credentials failed
             if username:
@@ -768,7 +784,7 @@ def run_depot_download(
                     fail("DepotDownloader output:")
                     for el in error_lines[-10:]:
                         print(f"         {C.DIM}{el}{C.RESET}")
-                return None
+                return False, username
 
             # Check if there was a real error after auth succeeded
             # (e.g. 401, access denied, missing manifest).
@@ -796,36 +812,44 @@ def run_depot_download(
                     fail("This may mean your Steam account does not own the")
                     fail("required depot files. Check that you own MW3 Multiplayer")
                     fail("(appid 42690) or Dedicated Server (appid 42750) on Steam.")
-                return None
+                return False, captured_username
+
+            # No QR shown means DepotDownloader failed for another reason
+            if not got_qr_refresh:
+                fail(f"DepotDownloader failed (exit code {proc.returncode}).")
+                for el in error_lines[-10:]:
+                    print(f"         {C.DIM}{el}{C.RESET}")
+                return False, None
 
             # Genuine QR expiry: no auth, no real errors, QR was shown
             if attempt >= max_qr_retries:
                 fail(f"QR login failed after {max_qr_retries} attempts.")
-                return None
+                return False, None
 
             warn("QR code expired. Generating a new one...")
 
         except FileNotFoundError:
             fail("DepotDownloader.exe not found or failed to execute.")
-            return None
+            return False, username
         except Exception as ex:
             fail(f"DepotDownloader error: {ex}")
-            return None
+            return False, username
 
 
 # ── Merge ────────────────────────────────────────────────────────────────────
 
-def merge_depots(staging_dir: str, target: str):
+def merge_depots(staging_dir: str, depot_dirs: list[str], target: str):
     """
-    Merge downloaded 32-bit depot files into target (the MW3 install
-    itself, or its downgrade/ folder).
+    Merge each downloaded depot folder (in order) into target (the MW3
+    install itself, or its downgrade/ folder), then remove staging_dir.
 
     Uses delete-then-move strategy:
       1. Delete old files that will be replaced (frees space).
       2. Move staged files into place (instant rename on same drive).
     """
     info(f"Merging 32-bit files into {target}...")
-    _merge_tree(staging_dir, target)
+    for depot_dir in depot_dirs:
+        _merge_tree(depot_dir, target)
     ok("Merge complete.")
 
     # Remove any DepotDownloader artifacts from the game folder
@@ -945,7 +969,7 @@ def main():
         print()
         # Offer manual path entry
         if ask_yes_no("Enter the MW3 install path manually?", default=False):
-            manual = input("  Path: ").strip().strip('"')
+            manual = os.path.normpath(input("  Path: ").strip().strip('"'))
             if os.path.isdir(manual):
                 installs = [{"appid": "manual", "label": "Manual", "install_dir": manual}]
             else:
@@ -1211,7 +1235,13 @@ def downgrade_install(install_dir: str, appid: str, steam_root: str) -> bool:
     press_enter()
 
     # ── Download depots ──────────────────────────────────────────
+    # Each depot gets its own staging subfolder so a failed DLC's
+    # partial files can be dropped without touching the others.
+    if os.path.isdir(staging_dir):
+        shutil.rmtree(staging_dir, ignore_errors=True)  # stale previous run
     username = None
+    depot_dirs = []
+    installed_dlc = []
     for i, depot_info in enumerate(depot_plan):
         print()
 
@@ -1229,26 +1259,38 @@ def downgrade_install(install_dir: str, appid: str, steam_root: str) -> bool:
             info(f"Depot {i + 1} of {len(depot_plan)}: "
                  f"{depot_info['depot']}")
 
-        result = run_depot_download(
-            dd_path, staging_dir, depot_info, username=username,
+        depot_dir = os.path.join(staging_dir, str(depot_info["depot"]))
+        success, username = run_depot_download(
+            dd_path, depot_dir, depot_info, username=username,
         )
-        if result is None:
+        if not success:
             fail(f"Failed to download depot {depot_info['depot']}.")
             if dlc_label:
-                fail(f"Could not download {dlc_label}. Your Steam account")
-                fail("may not own this DLC collection.")
-            # Cleanup partial staging
-            if os.path.isdir(staging_dir):
-                shutil.rmtree(staging_dir, ignore_errors=True)
-            if not dlc_label:
-                _offer_ds_install(appid)
+                # Unowned DLC is normal: drop it and keep going
+                warn(f"Skipping {dlc_label}. Your Steam account may not own it.")
+                shutil.rmtree(depot_dir, ignore_errors=True)
+                continue
+            # Base depot failed: nothing usable, clean up everything
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            _offer_ds_install(appid)
             return False
-        # Remember username for subsequent depots (skip QR)
-        username = result
+        depot_dirs.append(depot_dir)
+        if dlc_label:
+            installed_dlc.append(dlc_label)
+
+    if not depot_dirs:
+        # Only reachable on a DLC-only run (a failed base depot returns
+        # above), so the 32-bit base game is already fine.
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        warn("None of the missing DLC could be downloaded (not owned on Steam).")
+        set_plutonium_path(target, only_if_empty)
+        print()
+        ok("Plutonium should work with this install (without that DLC).")
+        return True
 
     # ── Merge ────────────────────────────────────────────────────
     print()
-    success = merge_depots(staging_dir, target)
+    success = merge_depots(staging_dir, depot_dirs, target)
 
     if success:
         if base_needed and needs_base_downgrade(target):
@@ -1266,15 +1308,15 @@ def downgrade_install(install_dir: str, appid: str, steam_root: str) -> bool:
             print()
             print(f"  {C.GREEN}{C.BOLD}{'=' * 54}{C.RESET}")
             print(f"  {C.GREEN}{C.BOLD}  MW3 downgraded to 32-bit successfully!{C.RESET}")
-            if dlc_keys:
-                names = ", ".join(IW5_DLC[k]["name"] for k in dlc_keys)
+            if installed_dlc:
+                names = ", ".join(installed_dlc)
                 print(f"  {C.GREEN}{C.BOLD}  DLC installed: {names}{C.RESET}")
             print(f"  {C.GREEN}{C.BOLD}  Plutonium should now work with this install.{C.RESET}")
             print(f"  {C.GREEN}{C.BOLD}{'=' * 54}{C.RESET}")
         else:
             # DLC-only install
             print()
-            names = ", ".join(IW5_DLC[k]["name"] for k in dlc_keys)
+            names = ", ".join(installed_dlc)
             print(f"  {C.GREEN}{C.BOLD}{'=' * 54}{C.RESET}")
             print(f"  {C.GREEN}{C.BOLD}  DLC installed: {names}{C.RESET}")
             print(f"  {C.GREEN}{C.BOLD}{'=' * 54}{C.RESET}")
