@@ -2,8 +2,9 @@
 mw3_downgrade.py — MW3 32-bit Depot Downgrader for Windows
 
 Detects 64-bit MW3 installs broken by Activision's update, downloads
-the 32-bit depot files via DepotDownloader (bundled), and merges them
-over the game directory so Plutonium works again.
+the 32-bit depot files via DepotDownloader (bundled), merges them over
+the game directory (or into a separate downgrade/ folder), and points
+Plutonium at them.
 
 Supports Windows 10/11. No Python install required when built with
 PyInstaller (--onefile --add-binary DepotDownloader.exe).
@@ -13,6 +14,7 @@ Licensed under the MIT License. Bundled with permission per license terms.
 """
 
 import ctypes
+import json
 import os
 import re
 import shutil
@@ -85,12 +87,15 @@ _DEPOTS_DS = (
     {"app": 42750, "depot": 42751, "manifest": "9089183337461621316"},
 )
 
-# Fallback when the install path is entered manually and we don't
-# know which app the user owns. Uses 42690 (MP) as the broadest bet.
-_DEPOTS_MANUAL = (
-    {"app": 42690, "depot": 42682, "manifest": "2661317971072643596"},
-    {"app": 42690, "depot": 42683, "manifest": "1595601894688570808"},  # language slot
-)
+# Optional: the 32-bit depot files can go into this subfolder of the
+# MW3 install instead of over it. The 64-bit Steam install stays
+# intact, so Steam updates and Verify never break Plutonium again.
+# Plutonium's iw5Path is pointed at whichever folder was used.
+DOWNGRADE_SUBDIR = "downgrade"
+
+
+def downgrade_dir(install_dir: str) -> str:
+    return os.path.join(install_dir, DOWNGRADE_SUBDIR)
 
 # Language depots. The depot ID and manifest change per language;
 # the app ID is set at runtime based on ownership (42690 or 42750).
@@ -152,9 +157,9 @@ IW5_DLC = {
 }
 
 
-def detect_dlc_status(install_dir: str) -> dict:
+def detect_dlc_status(game_dir: str) -> dict:
     """
-    Check each DLC collection's marker file in the install directory.
+    Check each DLC collection's marker file in the game folder.
     Returns a dict keyed by collection number ("1".."4") with values:
       "ok"      - marker present and correct size
       "missing" - marker file does not exist
@@ -162,7 +167,7 @@ def detect_dlc_status(install_dir: str) -> dict:
     """
     status = {}
     for key, dlc in IW5_DLC.items():
-        marker_path = os.path.join(install_dir, dlc["marker"])
+        marker_path = os.path.join(game_dir, dlc["marker"])
         if not os.path.isfile(marker_path):
             status[key] = "missing"
         else:
@@ -207,12 +212,10 @@ def get_depot_plan(appid: str, language: dict | None = None,
     """
     if appid == "42750":
         plan = list(_DEPOTS_DS)
-    elif appid in ("42690", "42680"):
-        # 42680 (base game) includes 42690 (MP), so both get the
-        # full SP+MP depot set.
-        plan = list(_DEPOTS_MP)
     else:
-        plan = list(_DEPOTS_MANUAL)
+        # 42680 (base game) includes 42690 (MP). Manual paths also use
+        # the MP set, the broadest bet when ownership is unknown.
+        plan = list(_DEPOTS_MP)
 
     # Add SP binaries if requested (only for MW3/MP owners, not DS)
     if include_sp and appid in ("42690", "42680"):
@@ -532,6 +535,83 @@ def is_iw5_64bit(install_dir: str) -> bool:
         return False
 
 
+def needs_base_downgrade(game_dir: str) -> bool:
+    """True if game_dir has no 32-bit base game (marker missing or 64-bit)."""
+    return (not os.path.isfile(os.path.join(game_dir, _IW5_MARKER_FILE))
+            or is_iw5_64bit(game_dir))
+
+
+# ── Plutonium config ─────────────────────────────────────────────────────────
+
+def _plutonium_running() -> bool:
+    try:
+        out = subprocess.run(["tasklist"], capture_output=True, text=True).stdout
+        return "plutonium" in out.lower()
+    except Exception:
+        return False
+
+
+def set_plutonium_path(game_dir: str, only_if_empty: bool = False):
+    """
+    Point Plutonium's MW3 game folder (iw5Path in
+    %LOCALAPPDATA%\\Plutonium\\config.json) at game_dir. Every other
+    key, including the login token, is kept. Falls back to telling the
+    user to set the folder in the launcher.
+    """
+    game_dir = os.path.normpath(game_dir)
+    config_path = os.path.join(os.environ.get("LOCALAPPDATA", ""),
+                               "Plutonium", "config.json")
+
+    def manual_hint():
+        info("Set MW3's game folder in the Plutonium launcher to:")
+        info(f"  {game_dir}")
+
+    print()
+    try:
+        with open(config_path, encoding="utf-8-sig") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("unexpected format")
+    except FileNotFoundError:
+        warn("Plutonium config not found (has the launcher been run yet?).")
+        manual_hint()
+        return
+    except (OSError, ValueError) as ex:
+        warn(f"Could not read Plutonium config: {ex}")
+        manual_hint()
+        return
+
+    current = data.get("iw5Path") or ""
+    if os.path.normcase(os.path.normpath(current or ".")) == os.path.normcase(game_dir):
+        ok("Plutonium is already set to use the downgrade folder.")
+        return
+    if only_if_empty and current:
+        info(f"Plutonium's MW3 folder is already set to: {current}")
+        info("Leaving it unchanged. To use this install instead, set it to:")
+        info(f"  {game_dir}")
+        return
+
+    # Plutonium may write its config back on exit, undoing our change
+    while _plutonium_running():
+        warn("Plutonium is running. Close it so its MW3 folder can be updated.")
+        press_enter("Press Enter once Plutonium is closed...")
+
+    data["iw5Path"] = game_dir
+    tmp = config_path + ".tmp"
+    try:
+        # Write-then-replace so a failed write can't wipe the login token
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, config_path)
+    except OSError as ex:
+        warn(f"Could not update Plutonium config: {ex}")
+        manual_hint()
+        return
+    ok(f"Plutonium MW3 folder set to: {game_dir}")
+    if current:
+        info(f"(was: {current})")
+
+
 # ── Disk space ───────────────────────────────────────────────────────────────
 
 def check_free_space_gb(path: str) -> float:
@@ -735,20 +815,21 @@ def run_depot_download(
 
 # ── Merge ────────────────────────────────────────────────────────────────────
 
-def merge_depots(staging_dir: str, install_dir: str):
+def merge_depots(staging_dir: str, target: str):
     """
-    Merge downloaded 32-bit depot files over the MW3 install.
+    Merge downloaded 32-bit depot files into target (the MW3 install
+    itself, or its downgrade/ folder).
 
     Uses delete-then-move strategy:
-      1. Delete old 64-bit files that will be replaced (frees space).
+      1. Delete old files that will be replaced (frees space).
       2. Move staged files into place (instant rename on same drive).
     """
-    info("Merging 32-bit files into MW3 install...")
-    _merge_tree(staging_dir, install_dir)
+    info(f"Merging 32-bit files into {target}...")
+    _merge_tree(staging_dir, target)
     ok("Merge complete.")
 
-    # Remove any DepotDownloader artifacts from the game directory
-    _cleanup_dd_artifacts(install_dir)
+    # Remove any DepotDownloader artifacts from the game folder
+    _cleanup_dd_artifacts(target)
 
     # Cleanup staging
     info("Cleaning up staging files...")
@@ -890,7 +971,11 @@ def main():
             print()
 
         # Check if all need downgrading
-        need_downgrade = [inst for inst in installs if is_iw5_64bit(inst["install_dir"])]
+        need_downgrade = [
+            inst for inst in installs
+            if needs_base_downgrade(inst["install_dir"])
+            and needs_base_downgrade(downgrade_dir(inst["install_dir"]))
+        ]
         all_option = None
         if len(need_downgrade) > 1:
             all_option = str(len(installs) + 1)
@@ -967,19 +1052,42 @@ def downgrade_install(install_dir: str, appid: str, steam_root: str) -> bool:
     """
     Run the full downgrade flow for a single MW3 install directory.
     Two phases, both fully automatic:
-      1. Base-game 32-bit downgrade (skipped if already 32-bit).
+      1. Base-game 32-bit downgrade (skipped if already 32-bit), either
+         in place or into a separate downgrade/ folder (user's choice).
       2. DLC detection and download (checks marker file sizes on
          disk, downloads any collection that is missing or wrong).
+    Then points Plutonium's MW3 folder at the 32-bit files.
     Returns True on success, False on failure.
     """
-    needs_base_downgrade = False
+    dg_dir = downgrade_dir(install_dir)
+    # Plutonium uses one iw5Path; a DS install only claims it when unset
+    # so it doesn't replace an MP install's folder.
+    only_if_empty = appid == "42750"
 
-    # ── Phase 1: base-game bitness check ─────────────────────────
+    # ── Phase 1: pick the folder and check bitness ───────────────
     info("Checking MW3 version...")
-    if is_iw5_64bit(install_dir):
-        needs_base_downgrade = True
-        warn("MW3 is 64-bit. Downgrade required for Plutonium.")
+    if os.path.isdir(dg_dir):
+        target = dg_dir
+        ok(f"Using separate downgrade folder: {dg_dir}")
+    elif not needs_base_downgrade(install_dir):
+        target = install_dir
     else:
+        warn("MW3 is 64-bit. Downgrade required for Plutonium.")
+        print()
+        info("Steam updates and 'Verify integrity of game files' replace the")
+        info("32-bit files and break Plutonium again. Installing them to a")
+        info("separate 'downgrade' folder leaves the Steam install untouched,")
+        info("so updates can't break Plutonium. It uses more disk space.")
+        if ask_yes_no("Install to a separate folder so Steam updates can't break it?",
+                      default=True):
+            target = dg_dir
+            ok(f"32-bit files will go into: {dg_dir}")
+        else:
+            target = install_dir
+            ok("32-bit files will replace the files in the Steam install.")
+
+    base_needed = needs_base_downgrade(target)
+    if not base_needed:
         print()
         ok("MW3 is already 32-bit. No base-game downgrade needed.")
 
@@ -988,7 +1096,7 @@ def downgrade_install(install_dir: str, appid: str, steam_root: str) -> bool:
     if appid != "manual":
         print()
         info("Checking DLC collections...")
-        dlc_status = detect_dlc_status(install_dir)
+        dlc_status = detect_dlc_status(target)
         for key in sorted(dlc_status):
             dlc = IW5_DLC[key]
             st = dlc_status[key]
@@ -1014,7 +1122,8 @@ def downgrade_install(install_dir: str, appid: str, steam_root: str) -> bool:
             ok("All DLC collections present and correct.")
 
     # If nothing to do, exit early
-    if not needs_base_downgrade and not dlc_keys:
+    if not base_needed and not dlc_keys:
+        set_plutonium_path(target, only_if_empty)
         print()
         ok("Plutonium should work with this install.")
         return True
@@ -1039,12 +1148,11 @@ def downgrade_install(install_dir: str, appid: str, steam_root: str) -> bool:
     ok(f"DepotDownloader ready: {os.path.basename(dd_path)}")
 
     # Build depot plan
-    include_sp = False
-    language = None
     depot_plan = []
 
-    if needs_base_downgrade:
+    if base_needed:
         # Ask about optional SP files (only relevant for MW3/MP owners)
+        include_sp = False
         if appid in ("42690", "42680"):
             print()
             include_sp = ask_yes_no("Also restore singleplayer files?", default=False)
@@ -1140,25 +1248,29 @@ def downgrade_install(install_dir: str, appid: str, steam_root: str) -> bool:
 
     # ── Merge ────────────────────────────────────────────────────
     print()
-    success = merge_depots(staging_dir, install_dir)
+    success = merge_depots(staging_dir, target)
 
     if success:
-        if needs_base_downgrade:
-            # Verify base-game downgrade
-            if not is_iw5_64bit(install_dir):
-                print()
-                print(f"  {C.GREEN}{C.BOLD}{'=' * 54}{C.RESET}")
-                print(f"  {C.GREEN}{C.BOLD}  MW3 downgraded to 32-bit successfully!{C.RESET}")
-                if dlc_keys:
-                    names = ", ".join(IW5_DLC[k]["name"] for k in dlc_keys)
-                    print(f"  {C.GREEN}{C.BOLD}  DLC installed: {names}{C.RESET}")
-                print(f"  {C.GREEN}{C.BOLD}  Plutonium should now work with this install.{C.RESET}")
-                print(f"  {C.GREEN}{C.BOLD}{'=' * 54}{C.RESET}")
+        if base_needed and needs_base_downgrade(target):
+            warn("Merge completed but MW3 still appears to be 64-bit.")
+            warn("The marker file (main/iw_00.iwd) size has not changed.")
+            if target == dg_dir:
+                warn(f"Delete {dg_dir} and run this tool again.")
             else:
-                warn("Merge completed but MW3 still appears to be 64-bit.")
-                warn("The marker file (main/iw_00.iwd) size has not changed.")
                 warn("Try verifying MW3 files in Steam, then run this tool again.")
-                return False
+            return False
+
+        set_plutonium_path(target, only_if_empty)
+
+        if base_needed:
+            print()
+            print(f"  {C.GREEN}{C.BOLD}{'=' * 54}{C.RESET}")
+            print(f"  {C.GREEN}{C.BOLD}  MW3 downgraded to 32-bit successfully!{C.RESET}")
+            if dlc_keys:
+                names = ", ".join(IW5_DLC[k]["name"] for k in dlc_keys)
+                print(f"  {C.GREEN}{C.BOLD}  DLC installed: {names}{C.RESET}")
+            print(f"  {C.GREEN}{C.BOLD}  Plutonium should now work with this install.{C.RESET}")
+            print(f"  {C.GREEN}{C.BOLD}{'=' * 54}{C.RESET}")
         else:
             # DLC-only install
             print()
