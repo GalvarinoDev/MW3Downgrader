@@ -1242,7 +1242,11 @@ def downgrade_install(install_dir: str, appid: str, steam_root: str) -> bool:
     username = None
     depot_dirs = []
     installed_dlc = []
-    for i, depot_info in enumerate(depot_plan):
+    ds_fallback_tried = False
+    i = -1
+    while i + 1 < len(depot_plan):
+        i += 1
+        depot_info = depot_plan[i]
         print()
 
         # Label DLC depots by collection name
@@ -1272,6 +1276,17 @@ def downgrade_install(install_dir: str, appid: str, steam_root: str) -> bool:
                 continue
             # Base depot failed: nothing usable, clean up everything
             shutil.rmtree(staging_dir, ignore_errors=True)
+            # No MW3 license: retry the whole base set under the free
+            # Dedicated Server app (42750). DLC only exists under 42690.
+            if depot_info["app"] == 42690 and not ds_fallback_tried:
+                ds_fallback_tried = True
+                print()
+                warn("Retrying with the free Dedicated Server depots (appid 42750)...")
+                depot_plan = get_depot_plan("42750", language)
+                depot_dirs = []
+                installed_dlc = []
+                i = -1
+                continue
             _offer_ds_install(appid)
             return False
         depot_dirs.append(depot_dir)
